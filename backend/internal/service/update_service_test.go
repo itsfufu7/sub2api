@@ -185,3 +185,47 @@ func TestUpdateServiceRollbackToVersionAcceptsVPrefix(t *testing.T) {
 	require.NotErrorIs(t, err, ErrRollbackVersionNotAllowed)
 	require.Contains(t, err.Error(), "no compatible release found")
 }
+
+type updateServiceRecordingClient struct {
+	latestRepo string
+	recentRepo string
+}
+
+func (c *updateServiceRecordingClient) FetchLatestRelease(_ context.Context, repo string) (*GitHubRelease, error) {
+	c.latestRepo = repo
+	return &GitHubRelease{TagName: "v0.2.7", Name: "v0.2.7"}, nil
+}
+
+func (c *updateServiceRecordingClient) FetchRecentReleases(_ context.Context, repo string, _ int) ([]*GitHubRelease, error) {
+	c.recentRepo = repo
+	return nil, nil
+}
+
+func (c *updateServiceRecordingClient) DownloadFile(context.Context, string, string, int64) error {
+	return nil
+}
+
+func (c *updateServiceRecordingClient) FetchChecksumFile(context.Context, string) ([]byte, error) {
+	return nil, nil
+}
+
+func TestUpdateServiceUsesConfiguredRepo(t *testing.T) {
+	// Empty repo falls back to this fork, not upstream.
+	defaultClient := &updateServiceRecordingClient{}
+	defaultSvc := NewUpdateServiceWithRepo(&updateServiceCacheStub{}, defaultClient, "0.2.7", "release", "")
+	_, err := defaultSvc.CheckUpdate(context.Background(), true)
+	require.NoError(t, err)
+	require.Equal(t, defaultGitHubRepo, defaultClient.latestRepo)
+	require.Equal(t, "itsfufu7/sub2api", defaultGitHubRepo)
+
+	// Explicit repo overrides the default on both code paths.
+	overrideClient := &updateServiceRecordingClient{}
+	overrideSvc := NewUpdateServiceWithRepo(&updateServiceCacheStub{}, overrideClient, "0.2.7", "release", "owner/name")
+	_, err = overrideSvc.CheckUpdate(context.Background(), true)
+	require.NoError(t, err)
+	require.Equal(t, "owner/name", overrideClient.latestRepo)
+
+	_, err = overrideSvc.ListRollbackVersions(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, "owner/name", overrideClient.recentRepo)
+}

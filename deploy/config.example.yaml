@@ -1201,6 +1201,11 @@ gemini:
 # Update Configuration (在线更新配置)
 # =============================================================================
 update:
+  # 在线更新检查/下载指向的 GitHub 仓库（owner/name）。
+  # 留空使用内置默认（本 fork: itsfufu7/sub2api），不再查询上游 Wei-Shaw/sub2api，
+  # 避免上游 release 覆盖本 fork 的改动（如 Codex 292 门票）。
+  # 环境变量：UPDATE_REPO
+  repo: ""
   # Proxy URL for accessing GitHub (used for online updates and pricing data)
   # 用于访问 GitHub 的代理地址（用于在线更新和定价数据获取）
   # Supports: http, https, socks5, socks5h
