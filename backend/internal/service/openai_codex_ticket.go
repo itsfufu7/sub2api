@@ -1,11 +1,13 @@
 package service
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net/http"
 	"net/url"
@@ -28,6 +30,12 @@ const (
 	openAICodexTicketStatePrefix     = "gAAAAA"
 	openAICodexTicketDefaultModel    = "gpt-6-astra"
 	openAICodexTicketDefaultSolModel = "gpt-5.6-sol"
+
+	// 打票响应体只读到第一个带 model 的事件即停止；上限避免异常响应拖住探测。
+	openAICodexTicketProbeBodyReadLimit = 64 * 1024
+	// 打票响应实际模型与目标模型不符时，对该 (账号, 模型) 冷却一段时间，
+	// 避免"坏票"账号在每个探测周期（默认 6 秒）被反复打票。
+	openAICodexTicketModelMismatchCooldown = 5 * time.Minute
 )
 
 // ErrOpenAICodexTicketUnavailable 表示该号该模型没有可用的 292 门票，
@@ -301,11 +309,21 @@ func (s *OpenAIGatewayService) applyOpenAICodexTicket(ctx context.Context, accou
 	ticket := s.lookupOpenAICodexTicket(account, model)
 	if ticket.valid(time.Now(), cfg.TargetLength) {
 		h.Set(openAICodexTurnStateHeader, ticket.State)
+		logger.L().Debug("openai_codex_ticket injected",
+			zap.Int64("account_id", account.ID),
+			zap.String("model", model),
+			zap.Int("length", ticket.Length),
+			zap.Time("expires_at", ticket.ExpiresAt))
 		return nil
 	}
 	if !cfg.FailClosed {
+		logger.L().Debug("openai_codex_ticket missing, forwarding without injection",
+			zap.Int64("account_id", account.ID), zap.String("model", model))
 		return nil
 	}
+	logger.L().Debug("openai_codex_ticket missing, blocking account",
+		zap.Int64("account_id", account.ID), zap.String("model", model),
+		zap.Bool("cooling_down", s.openAICodexTicketModelMismatchCoolingDown(account.ID, model)))
 	return ErrOpenAICodexTicketUnavailable
 }
 
@@ -357,14 +375,14 @@ func (s *OpenAIGatewayService) openAICodexTicketBlocksAccount(account *Account, 
 	return !ticket.valid(time.Now(), cfg.TargetLength)
 }
 
-func (s *OpenAIGatewayService) fireOpenAICodexTicketProbe(ctx context.Context, account *Account, token, model, proxyURL string, attemptTimeout time.Duration) (state string, status int, err error) {
+func (s *OpenAIGatewayService) fireOpenAICodexTicketProbe(ctx context.Context, account *Account, token, model, proxyURL string, attemptTimeout time.Duration) (state string, actualModel string, status int, err error) {
 	attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
 	defer cancel()
 
 	body := []byte(`{"model":` + jsonString(model) + `,"store":false,"stream":true,"instructions":"Reply with exactly: pong","input":[{"role":"user","content":[{"type":"input_text","text":"ping"}]}]}`)
 	req, err := http.NewRequestWithContext(attemptCtx, http.MethodPost, chatgptCodexURL, bytes.NewReader(body))
 	if err != nil {
-		return "", 0, err
+		return "", "", 0, err
 	}
 	req = req.WithContext(WithHTTPUpstreamProfile(req.Context(), HTTPUpstreamProfileOpenAIHarvest))
 	req.Close = true
@@ -375,7 +393,7 @@ func (s *OpenAIGatewayService) fireOpenAICodexTicketProbe(ctx context.Context, a
 	req.Header.Set("OpenAI-Beta", "responses=experimental")
 	req.Header.Set("session_id", uuid.NewString())
 	if err := resolveAndSetOpenAIChatGPTAccountHeaders(attemptCtx, s.accountRepo, req.Header, account); err != nil {
-		return "", 0, err
+		return "", "", 0, err
 	}
 	applyOpenAICodexTicketHarvestIdentity(req.Header, model)
 
@@ -384,18 +402,123 @@ func (s *OpenAIGatewayService) fireOpenAICodexTicketProbe(ctx context.Context, a
 	// while handlers are still wiring it during gateway construction.
 	resp, err := s.httpUpstream.Do(req, proxyURL, account.ID, account.Concurrency)
 	if err != nil {
-		return "", 0, err
+		return "", "", 0, err
 	}
 	if resp == nil {
-		return "", 0, errors.New("nil upstream response")
+		return "", "", 0, errors.New("nil upstream response")
 	}
-	// Only the response header is needed; no connection will be reused.
+	// Only the response header is needed for the ticket; the body is read just
+	// far enough to learn which model actually served the probe. No connection
+	// will be reused.
 	defer func() {
 		if resp.Body != nil {
 			_ = resp.Body.Close()
 		}
 	}()
-	return extractOpenAICodexTurnState(resp.Header), resp.StatusCode, nil
+	state = extractOpenAICodexTurnState(resp.Header)
+	if resp.StatusCode == http.StatusOK {
+		actualModel = readOpenAICodexTicketProbeModel(resp)
+	}
+	return state, actualModel, resp.StatusCode, nil
+}
+
+// readOpenAICodexTicketProbeModel 从打票响应里取出上游实际服务的模型名。
+// 打票请求强制 stream=true，正常返回 SSE；这里只读到第一个带 model 的事件就返回，
+// 不读完整个流，保持打票开销可忽略。解析不到时返回空串，调用方按「未知」处理。
+func readOpenAICodexTicketProbeModel(resp *http.Response) string {
+	if resp == nil || resp.Body == nil {
+		return ""
+	}
+	limited := io.LimitReader(resp.Body, openAICodexTicketProbeBodyReadLimit)
+	if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "application/json") {
+		payload, _ := io.ReadAll(limited)
+		return openAICodexTicketProbeModelFromPayload(string(payload))
+	}
+	reader := bufio.NewReader(limited)
+	for {
+		line, err := reader.ReadString('\n')
+		if model := openAICodexTicketProbeModelFromSSELine(line); model != "" {
+			return model
+		}
+		if err != nil {
+			return ""
+		}
+	}
+}
+
+func openAICodexTicketProbeModelFromSSELine(line string) string {
+	line = strings.TrimSpace(line)
+	if line == "" || !strings.HasPrefix(line, "data:") {
+		return ""
+	}
+	return openAICodexTicketProbeModelFromPayload(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+}
+
+func openAICodexTicketProbeModelFromPayload(payload string) string {
+	payload = strings.TrimSpace(payload)
+	if payload == "" || payload == "[DONE]" || !strings.HasPrefix(payload, "{") || !gjson.Valid(payload) {
+		return ""
+	}
+	if model := strings.TrimSpace(gjson.Get(payload, "response.model").String()); model != "" {
+		return model
+	}
+	return strings.TrimSpace(gjson.Get(payload, "model").String())
+}
+
+// openAICodexTicketProbeModelMatches 判断打票响应实际服务的模型是否就是目标模型。
+// comparable=false 表示响应里没有可判定的模型名（解析不到），调用方应放行而不是误杀。
+func openAICodexTicketProbeModelMatches(target, actual string) (matched bool, comparable bool) {
+	actual = normalizeOpenAICodexTicketModel(actual)
+	target = normalizeOpenAICodexTicketModel(target)
+	if target == "" || actual == "" {
+		return false, false
+	}
+	return canonicalOpenAICodexTicketModel(target) == canonicalOpenAICodexTicketModel(actual), true
+}
+
+// canonicalOpenAICodexTicketModel 把模型名归一到可比对的基名，容忍日期/供应商
+// 前缀与已知变体（例如 gpt-6-astra-2026-01-01 → gpt-6-astra）。
+func canonicalOpenAICodexTicketModel(model string) string {
+	model = normalizeOpenAICodexTicketModel(model)
+	if model == "" {
+		return ""
+	}
+	if isOpenAIGPT6AstraModel(model) {
+		return "gpt-6-astra"
+	}
+	if canonical := normalizeKnownOpenAICodexModel(model); canonical != "" {
+		return canonical
+	}
+	return strings.ToLower(model)
+}
+
+func (s *OpenAIGatewayService) openAICodexTicketModelMismatchCoolingDown(accountID int64, model string) bool {
+	if s == nil || accountID <= 0 {
+		return false
+	}
+	raw, ok := s.openaiCodexTicketMismatchUntil.Load(openAICodexTicketKey(accountID, model))
+	if !ok {
+		return false
+	}
+	until, ok := raw.(time.Time)
+	return ok && time.Now().Before(until)
+}
+
+func (s *OpenAIGatewayService) markOpenAICodexTicketModelMismatch(accountID int64, model string) {
+	if s == nil || accountID <= 0 {
+		return
+	}
+	s.openaiCodexTicketMismatchUntil.Store(
+		openAICodexTicketKey(accountID, model),
+		time.Now().Add(openAICodexTicketModelMismatchCooldown),
+	)
+}
+
+func (s *OpenAIGatewayService) clearOpenAICodexTicketModelMismatch(accountID int64, model string) {
+	if s == nil || accountID <= 0 {
+		return
+	}
+	s.openaiCodexTicketMismatchUntil.Delete(openAICodexTicketKey(accountID, model))
 }
 
 func jsonString(v string) string {
@@ -537,6 +660,9 @@ func (s *OpenAIGatewayService) probeOnceOpenAICodexTicket(ctx context.Context, a
 	if proxyURL == "" || s.httpUpstream == nil || ctx.Err() != nil {
 		return
 	}
+	if s.openAICodexTicketModelMismatchCoolingDown(account.ID, model) {
+		return
+	}
 	key := openAICodexTicketKey(account.ID, model)
 	_, _, _ = s.openaiCodexTicketFlight.Do(key, func() (any, error) {
 		token, _, err := s.GetAccessToken(ctx, account)
@@ -546,7 +672,7 @@ func (s *OpenAIGatewayService) probeOnceOpenAICodexTicket(ctx context.Context, a
 				zap.String("reason", "token"), zap.Error(err))
 			return nil, nil
 		}
-		state, status, perr := s.fireOpenAICodexTicketProbe(ctx, account, token, model, proxyURL, time.Duration(cfg.HarvestAttemptTimeoutSeconds)*time.Second)
+		state, actualModel, status, perr := s.fireOpenAICodexTicketProbe(ctx, account, token, model, proxyURL, time.Duration(cfg.HarvestAttemptTimeoutSeconds)*time.Second)
 		if perr != nil {
 			logger.L().Info("openai_codex_ticket probe miss",
 				zap.Int64("account_id", account.ID), zap.String("model", model),
@@ -559,6 +685,21 @@ func (s *OpenAIGatewayService) probeOnceOpenAICodexTicket(ctx context.Context, a
 				zap.Int("http", status), zap.Int("len", len(state)))
 			return nil, nil
 		}
+		// 票只有在"上游确实按目标模型服务了这一发"时才有意义：如果打票请求本身
+		// 就被降级成别的模型，这 292 头是那个模型的身份，注入到目标模型请求上反而
+		// 掩盖不了降级。此处按实际模型校验，不符则弃票并冷却。
+		if matched, comparable := openAICodexTicketProbeModelMatches(model, actualModel); comparable && !matched {
+			s.markOpenAICodexTicketModelMismatch(account.ID, model)
+			logger.L().Info("openai_codex_ticket probe miss",
+				zap.Int64("account_id", account.ID), zap.String("model", model),
+				zap.String("reason", "model_mismatch"), zap.String("actual_model", actualModel))
+			return nil, nil
+		}
+		if strings.TrimSpace(actualModel) == "" {
+			logger.L().Debug("openai_codex_ticket probe model not reported",
+				zap.Int64("account_id", account.ID), zap.String("model", model))
+		}
+		s.clearOpenAICodexTicketModelMismatch(account.ID, model)
 		now := time.Now()
 		ticket := &openAICodexTicket{
 			AccountID:  account.ID,
@@ -572,7 +713,8 @@ func (s *OpenAIGatewayService) probeOnceOpenAICodexTicket(ctx context.Context, a
 		s.storeOpenAICodexTicket(ctx, account, ticket)
 		logger.L().Info("openai_codex_ticket harvested",
 			zap.Int64("account_id", account.ID), zap.String("model", model),
-			zap.Int("length", ticket.Length), zap.String("mode", "continuous"))
+			zap.Int("length", ticket.Length), zap.String("actual_model", actualModel),
+			zap.String("mode", "continuous"))
 		return nil, nil
 	})
 }

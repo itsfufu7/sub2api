@@ -59,7 +59,7 @@ func TestCodexTicketProbeBypassesPluginDuringWiring(t *testing.T) {
 	}()
 	close(start)
 	for i := 0; i < 20; i++ {
-		state, status, err := svc.fireOpenAICodexTicketProbe(context.Background(), account, "test-token", "gpt-6-astra", "http://proxy.example.com:8080", time.Second)
+		state, _, status, err := svc.fireOpenAICodexTicketProbe(context.Background(), account, "test-token", "gpt-6-astra", "http://proxy.example.com:8080", time.Second)
 		require.NoError(t, err)
 		require.Equal(t, http.StatusOK, status)
 		require.Len(t, state, 292)
@@ -168,16 +168,21 @@ type codexTicketHeaderOnlyBody struct{ reads, closes int }
 
 func (b *codexTicketHeaderOnlyBody) Read([]byte) (int, error) { b.reads++; return 0, io.EOF }
 func (b *codexTicketHeaderOnlyBody) Close() error             { b.closes++; return nil }
-func TestCodexTicketProbeClosesStreamWithoutDraining(t *testing.T) {
+
+// Probe 现在需要读一点响应体来判定上游实际模型，因此不再"完全不读 body"；
+// 但仍应在拿到模型或遇到 EOF 后立刻停止，并关闭流。
+func TestCodexTicketProbeReadsStreamOnlyUntilModelThenCloses(t *testing.T) {
 	body := &codexTicketHeaderOnlyBody{}
 	svc := ticketTestService(t, config.OpenAICodexTicketConfig{}, &codexTicketFuncUpstream{do: func(*http.Request) (*http.Response, error) {
 		response := codexTicketResponse()
 		response.Body = body
 		return response, nil
 	}})
-	_, _, err := svc.fireOpenAICodexTicketProbe(context.Background(), ticketTestAccount(41), "test-token", "gpt-6-astra", "", time.Second)
+	_, actualModel, _, err := svc.fireOpenAICodexTicketProbe(context.Background(), ticketTestAccount(41), "test-token", "gpt-6-astra", "", time.Second)
 	require.NoError(t, err)
-	require.Zero(t, body.reads)
+	require.Empty(t, actualModel)
+	require.Positive(t, body.reads)
+	require.LessOrEqual(t, body.reads, 2)
 	require.Equal(t, 1, body.closes)
 }
 

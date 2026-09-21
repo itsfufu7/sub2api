@@ -512,9 +512,12 @@ type OpenAIGatewayService struct {
 	openaiCodexTickets           sync.Map
 	openaiCodexTicketFlight      singleflight.Group
 	openaiCodexTicketLifecycleMu sync.Mutex
-	openaiCodexTicketCancel      context.CancelFunc
-	openaiCodexTicketDone        chan struct{}
-	openaiCodexTicketStopped     bool
+	// openaiCodexTicketMismatchUntil: accountID\x00model → time.Time，
+	// 打票响应实际模型与目标模型不符时的冷却截止时间，避免坏票账号被反复探测。
+	openaiCodexTicketMismatchUntil sync.Map
+	openaiCodexTicketCancel        context.CancelFunc
+	openaiCodexTicketDone          chan struct{}
+	openaiCodexTicketStopped       bool
 }
 
 // NewOpenAIGatewayService creates a new OpenAIGatewayService

@@ -448,3 +448,102 @@ func TestOpenAICodexTicketGate_CompactRequestUsesForwardOutboundModel(t *testing
 	// 回归锚点：按客户端原始模型判定（旧实现的口径）在 compact 下必然误拦。
 	require.True(t, svc.openAICodexTicketBlocksAccount(account, canonicalOpenAIAccountSchedulingModel(account, "gpt-6-astra")))
 }
+
+func TestOpenAICodexTicketProbeModelParsing(t *testing.T) {
+	cases := []struct {
+		name string
+		line string
+		want string
+	}{
+		{"sse response.created", `data: {"type":"response.created","response":{"model":"gpt-6-astra"}}`, "gpt-6-astra"},
+		{"sse top-level model", `data: {"model":"gpt-5.6-luna"}`, "gpt-5.6-luna"},
+		{"event line ignored", `event: response.created`, ""},
+		{"done ignored", `data: [DONE]`, ""},
+		{"non-json ignored", `data: ping`, ""},
+		{"empty", ``, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, openAICodexTicketProbeModelFromSSELine(tc.line))
+		})
+	}
+	require.Equal(t, "gpt-6-astra", openAICodexTicketProbeModelFromPayload(`{"response":{"model":"gpt-6-astra"}}`))
+	require.Empty(t, openAICodexTicketProbeModelFromPayload(``))
+}
+
+func TestOpenAICodexTicketProbeModelMatches(t *testing.T) {
+	matched, comparable := openAICodexTicketProbeModelMatches("gpt-6-astra", "gpt-6-astra")
+	require.True(t, matched)
+	require.True(t, comparable)
+
+	// 日期/变体后缀应归一到同一基名。
+	matched, comparable = openAICodexTicketProbeModelMatches("gpt-6-astra", "gpt-6-astra-2026-01-01")
+	require.True(t, matched)
+	require.True(t, comparable)
+
+	matched, comparable = openAICodexTicketProbeModelMatches("gpt-6-astra", "gpt-5.6-luna")
+	require.False(t, matched)
+	require.True(t, comparable)
+
+	// 无法判定实际模型时不误杀。
+	matched, comparable = openAICodexTicketProbeModelMatches("gpt-6-astra", "")
+	require.False(t, matched)
+	require.False(t, comparable)
+}
+
+func TestHarvestOpenAICodexTicketRejectsModelMismatchAndCoolsDown(t *testing.T) {
+	state292 := fakeCodexTicketState(292)
+	header := http.Header{}
+	header.Set(openAICodexTurnStateHeader, state292)
+	upstream := &httpUpstreamRecorder{responses: []*http.Response{{
+		StatusCode: http.StatusOK,
+		Header:     header,
+		Body:       io.NopCloser(strings.NewReader(`data: {"type":"response.created","response":{"model":"gpt-5.6-luna"}}` + "\n\n")),
+	}}}
+	svc := ticketTestService(t, config.OpenAICodexTicketConfig{
+		Enabled:                      true,
+		TargetLength:                 292,
+		TTLSeconds:                   3600,
+		HarvestProxyURL:              "socks5h://harvest.example:31",
+		HarvestAttemptTimeoutSeconds: 5,
+		FailClosed:                   true,
+	}, upstream)
+	account := ticketTestAccount(41)
+
+	svc.probeOnceOpenAICodexTicket(context.Background(), account, "gpt-6-astra")
+	// 上游实际给的是 luna：不得落票，且视为冷却。
+	require.Nil(t, svc.lookupOpenAICodexTicket(account, "gpt-6-astra"))
+	require.True(t, svc.openAICodexTicketModelMismatchCoolingDown(account.ID, "gpt-6-astra"))
+	require.True(t, svc.openAICodexTicketBlocksAccount(account, "gpt-6-astra"))
+	require.Len(t, upstream.requests, 1)
+
+	// 冷却期内不再探测（避免坏票账号被反复打票）。
+	svc.probeOnceOpenAICodexTicket(context.Background(), account, "gpt-6-astra")
+	require.Len(t, upstream.requests, 1)
+}
+
+func TestHarvestOpenAICodexTicketAcceptsMatchingModelVariant(t *testing.T) {
+	state292 := fakeCodexTicketState(292)
+	header := http.Header{}
+	header.Set(openAICodexTurnStateHeader, state292)
+	upstream := &httpUpstreamRecorder{responses: []*http.Response{{
+		StatusCode: http.StatusOK,
+		Header:     header,
+		Body:       io.NopCloser(strings.NewReader(`data: {"response":{"model":"gpt-6-astra-2026-01-01"}}` + "\n\n")),
+	}}}
+	svc := ticketTestService(t, config.OpenAICodexTicketConfig{
+		Enabled:                      true,
+		TargetLength:                 292,
+		TTLSeconds:                   3600,
+		HarvestProxyURL:              "socks5h://harvest.example:31",
+		HarvestAttemptTimeoutSeconds: 5,
+		FailClosed:                   true,
+	}, upstream)
+	account := ticketTestAccount(41)
+
+	svc.probeOnceOpenAICodexTicket(context.Background(), account, "gpt-6-astra")
+	ticket := svc.lookupOpenAICodexTicket(account, "gpt-6-astra")
+	require.NotNil(t, ticket)
+	require.Equal(t, state292, ticket.State)
+	require.False(t, svc.openAICodexTicketModelMismatchCoolingDown(account.ID, "gpt-6-astra"))
+}
