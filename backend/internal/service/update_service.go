@@ -30,7 +30,11 @@ var (
 const (
 	updateCacheKey = "update_check_cache"
 	updateCacheTTL = 1200 // 20 minutes
-	githubRepo     = "Wei-Shaw/sub2api"
+
+	// defaultGitHubRepo 是本 fork 的在线更新源。上游已移除 Codex 292 门票
+	// 等能力，继续跟随上游 release 会把这些改动覆盖掉，因此默认指向本 fork。
+	// 可用 update.repo / UPDATE_REPO 覆盖。
+	defaultGitHubRepo = "itsfufu7/sub2api"
 
 	// Security: allowed download domains for updates
 	allowedDownloadHost = "github.com"
@@ -65,15 +69,27 @@ type UpdateService struct {
 	githubClient   GitHubReleaseClient
 	currentVersion string
 	buildType      string // "source" for manual builds, "release" for CI builds
+	repo           string // "owner/name" for update checks
 }
 
-// NewUpdateService creates a new UpdateService
+// NewUpdateService creates a new UpdateService using the built-in default repo.
 func NewUpdateService(cache UpdateCache, githubClient GitHubReleaseClient, version, buildType string) *UpdateService {
+	return NewUpdateServiceWithRepo(cache, githubClient, version, buildType, "")
+}
+
+// NewUpdateServiceWithRepo creates an UpdateService that checks releases from repo.
+// An empty repo falls back to defaultGitHubRepo.
+func NewUpdateServiceWithRepo(cache UpdateCache, githubClient GitHubReleaseClient, version, buildType, repo string) *UpdateService {
+	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		repo = defaultGitHubRepo
+	}
 	return &UpdateService{
 		cache:          cache,
 		githubClient:   githubClient,
 		currentVersion: version,
 		buildType:      buildType,
+		repo:           repo,
 	}
 }
 
@@ -363,7 +379,7 @@ func (s *UpdateService) RollbackToVersion(ctx context.Context, version string) e
 // fetchRollbackCandidates fetches recent releases and keeps the newest
 // maxRollbackVersions entries strictly older than the current version.
 func (s *UpdateService) fetchRollbackCandidates(ctx context.Context) ([]*GitHubRelease, error) {
-	releases, err := s.githubClient.FetchRecentReleases(ctx, githubRepo, rollbackFetchPageSize)
+	releases, err := s.githubClient.FetchRecentReleases(ctx, s.repo, rollbackFetchPageSize)
 	if err != nil {
 		return nil, err
 	}
@@ -400,7 +416,7 @@ func (s *UpdateService) fetchRollbackCandidates(ctx context.Context) ([]*GitHubR
 }
 
 func (s *UpdateService) fetchLatestRelease(ctx context.Context) (*UpdateInfo, error) {
-	release, err := s.githubClient.FetchLatestRelease(ctx, githubRepo)
+	release, err := s.githubClient.FetchLatestRelease(ctx, s.repo)
 	if err != nil {
 		return nil, err
 	}

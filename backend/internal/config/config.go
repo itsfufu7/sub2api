@@ -172,6 +172,10 @@ type GeminiTierQuotaConfig struct {
 }
 
 type UpdateConfig struct {
+	// Repo 在线更新检查与下载指向的 GitHub 仓库（owner/name）。
+	// 空值时使用内置默认（本 fork 为 itsfufu7/sub2api），可用 update.repo
+	// 或 UPDATE_REPO 覆盖。留空即跟随本 fork 的 release，不再查询上游。
+	Repo string `mapstructure:"repo"`
 	// ProxyURL 用于访问 GitHub 的代理地址
 	// 支持 http/https/socks5/socks5h 协议
 	// 例如: "http://127.0.0.1:7890", "socks5://127.0.0.1:1080"
@@ -2618,7 +2622,9 @@ func setEnvReachableDefaults() {
 	viper.SetDefault("gateway.session_idle_timeout_minutes", 0)
 	viper.SetDefault("gateway.user_message_queue.mode", "")
 	viper.SetDefault("update.proxy_url", "")
-
+	// Registered so AutomaticEnv can reach UPDATE_REPO; empty keeps the built-in
+	// fork default in the service layer.
+	viper.SetDefault("update.repo", "")
 	// sticky_escape_enabled is the one exception to the zero-value rule: its
 	// effective default is true, applied post-unmarshal via a viper.IsSet guard.
 	// Registering false would make IsSet always report true and permanently
